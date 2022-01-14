@@ -31,7 +31,7 @@
 */
 
 //v1 - Adapted from the Boron Connected Counter Code at release v44
-//v1.20 - Initial deployment to Morrisville
+//v1.20 - Initial deployment to Morrisville, 6 hour wakeup, no more sensor config vairable. 
 
 // Particle Product definitions
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
@@ -141,7 +141,6 @@ char percentFullStr[12];                             // How full is the trashcan
 char lowPowerModeStr[16];                           // In low power mode?
 char openTimeStr[8]="NA";                           // Park Open Time
 char closeTimeStr[8]="NA";                          // Park close Time
-char sensorTypeConfigStr[16];
 bool systemStatusWriteNeeded = false;               // Keep track of when we need to write - system object
 bool currentStatusWriteNeeded = false;              // Current counts object write needed
 
@@ -186,7 +185,6 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("Alerts",current.alerts);
   Particle.variable("TimeOffset",currentOffsetStr);
   Particle.variable("BatteryContext",batteryContextMessage);
-  Particle.variable("SensorStatus",sensorTypeConfigStr);
 
   Particle.function("setTrashEmpty", setTrashEmpty);                  // These are the functions exposed to the mobile app and console
   Particle.function("setTrashFull",setTrashFull);
@@ -831,10 +829,6 @@ void loadSystemDefaults() {                                           // Default
   *
   */
 void checkSystemValues() {                                          // Checks to ensure that all system values are in reasonable range
-  if (sysStatus.sensorType > 1) {                                   // Values are 0 for Pressure and 1 for PIR
-    sysStatus.sensorType = 0;
-    strncpy(sensorTypeConfigStr,"Pressure Sensor",sizeof(sensorTypeConfigStr));
-  }
   if (sysStatus.resetCount < 0 || sysStatus.resetCount > 255) sysStatus.resetCount = 0;
   if (sysStatus.timezone < -12 || sysStatus.timezone > 12) sysStatus.timezone = -5;
   if (sysStatus.dstOffset < 0 || sysStatus.dstOffset > 2) sysStatus.dstOffset = 1;
