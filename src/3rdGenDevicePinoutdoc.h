@@ -10,10 +10,10 @@
  * D17 - A2 -
  * D16 - A3 -
  * D15 - A4 -               TMP32 Temp Sensor
- * D14 - A5 / SPI SS -      disableModule
- * D13 - SCK - SPI Clock -  intPin
+ * D14 - A5 / SPI SS -      
+ * D13 - SCK - SPI Clock -  
  * D12 - MO - SPI MOSI -    
- * D11 - MI - SPI MISO -    ledPower
+ * D11 - MI - SPI MISO -    
  * D10 - UART RX -
  * D9 - UART TX -
 
@@ -26,9 +26,9 @@
  * D6 -                     DEEP-SLEEP Enable Pin - Brings Enable Pin low - Only RTC Alarm interrupt will wake
  * D5 -                     Done Pin Connected to the Watchdog Timer
  * D4 -                     User Switch
- * D3 - 
- * D2 - 
- * D1 - SCL - I2C Clock -   FRAM / RTC and I2C Bus
+ * D3 -                     Shutdown pin for the VL53L1X
+ * D2 -                     GPIO for the VL53L1X
+ * D1 - SCL - I2C Clock -   FRAM / RTC and I2C Bus  - Items on the i2c bus include FRAM, AB1805 WTC / RTC and the VL53L1x TOF sensor
  * D0 - SDA - I2C Data -    FRAM / RTX and I2C Bus
  *
  *
@@ -38,6 +38,6 @@
 /**
  * @file   3rdGenDevicePinoutdoc.h
  * @author Chip McClelland
- * @date   1-24-2020
+ * @date   1-14-2022
  * @brief  File containing the pinout documentation for 3rd Generation Particle Devices.
  * */
