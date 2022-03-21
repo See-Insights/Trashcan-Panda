@@ -12,7 +12,7 @@ struct systemStatus_structure {
   bool solarPowerMode;                              // Powered by a solar panel or utility power
   bool lowPowerMode;                                // Does the device need to run disconnected to save battery
   uint8_t lowBatteryMode;                           // Is the battery level so low that we can no longer connect
-  int stateOfCharge;                                // Battery charge level
+  double batteryVoltage;                             // Battery voltage level
   uint8_t batteryState;                             // Stores the current battery state
   int resetCount;                                   // reset count of device (0-256)
   float timezone;                                   // Time zone value -12 to +12

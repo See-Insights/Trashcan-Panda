@@ -32,11 +32,12 @@
 
 //v1 - Adapted from the Boron Connected Counter Code at release v44
 //v1.20 - Initial deployment to Morrisville, 6 hour wakeup, no more sensor config vairable. 
+//v1.30 - New version to accomodate LIS3DH sensor and the new pinouts on the Trashcan Panda sensor board
 
 // Particle Product definitions
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(1);
-char currentPointRelease[6] ="1.20";
+char currentPointRelease[6] ="1.30";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -46,7 +47,7 @@ namespace FRAM {                                    // Moved to namespace instea
   };
 };
 
-const int FRAMversionNumber = 1;                    // Increment this number each time the memory map is changed
+const int FRAMversionNumber = 2;                    // Increment this number each time the memory map is changed
 
 struct currentStatus_structure {                    // currently 10 bytes long
   int trashHeight;                                  // Current trash height in inches
@@ -69,6 +70,7 @@ struct currentStatus_structure {                    // currently 10 bytes long
 #include "PublishQueuePosixRK.h"
 #include "MB85RC256V-FRAM-RK.h"
 #include "SparkFun_VL53L1X.h"
+#include "LIS3DH.h"
 
 // Libraries to move out common functions
 #include "time_zone_fn.h"
@@ -84,6 +86,15 @@ unsigned long connectMaxTimeSec = 10 * 60;   // Timeout for trying to connect to
 // If updating, we need to delay sleep in order to give the download time to come through before sleeping
 const std::chrono::milliseconds firmwareUpdateMaxTime = 10min; // Set at least 5 minutes
 
+// Pin Constants - Boron Carrier Board v1.x
+const int tmp36Pin =      A4;                       // Simple Analog temperature sensor - on the carrier board - inside the enclosure
+const int wakeUpPin =     D8;                       // This is the Particle Electron WKP pin
+const int blueLED =       D7;                       // This LED is on the Electron itself
+const int userSwitch =    D4;                       // User switch with a pull-up resistor
+// Pin Constants - Sensor
+const int disableModule = D2;                       // Pin to shut down the device - active low
+const int intPin =        D3;                       // Hardware interrupt - poliarity set in the library
+
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
 SYSTEM_THREAD(ENABLED);                             // Means my code will not be held up by Particle processes.
@@ -92,10 +103,11 @@ SystemSleepConfiguration config;                    // Initialize new Sleep 2.0 
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
 AB1805 ab1805(Wire);                                // Rickkas' RTC / Watchdog library
 FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state
-
+LIS3DHI2C accel(Wire, 1, intPin);                   // Initialize the accelerometer in i2c mode
+SFEVL53L1X distanceSensor;                          // Initialize the TOF sensor - no interrupts
 
 // For monitoring / debugging, you can uncomment the next line
-// SerialLogHandler logHandler(LOG_LEVEL_ALL);
+Serial1LogHandler logHandler1(LOG_LEVEL_INFO);
 SerialLogHandler logHandler(LOG_LEVEL_INFO);
 
 // State Machine Variables
@@ -107,18 +119,6 @@ State oldState = INITIALIZATION_STATE;
 // Battery Conect variables
 // Battery conect information - https://docs.particle.io/reference/device-os/firmware/boron/#batterystate-
 const char* batteryContext[7] = {"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
-
-// Pin Constants - Boron Carrier Board v1.x
-const int tmp36Pin =      A4;                       // Simple Analog temperature sensor - on the carrier board - inside the enclosure
-const int wakeUpPin =     D8;                       // This is the Particle Electron WKP pin
-const int blueLED =       D7;                       // This LED is on the Electron itself
-const int userSwitch =    D4;                       // User switch with a pull-up resistor
-// Pin Constants - Sensor
-const int disableModule = D3;                       // Pin to shut down the device - active low
-const int intPin =        D2;                       // Hardware interrupt - poliarity set in the library
-
-// SFEVL53L1X distanceSensor(Wire, disableModule, intPin); // Need to put below the pin definition 
-SFEVL53L1X distanceSensor;
 
 // Timing Variables
 const int wakeBoundary = 1*3600 + 0*60 + 0;         // Sets a reporting frequency of 1 hour 0 minutes 0 seconds
@@ -156,12 +156,20 @@ Timer verboseCountsTimer(2*3600*1000, userSwitchISR, true);   // This timer will
 
 void setup()                                        // Note: Disconnected Setup()
 {
+  	// Make sure you match the same Wire interface in the constructor to LIS3DHI2C to this!
+	Wire.setSpeed(CLOCK_SPEED_100KHZ);
   Wire.begin();                                     // Not sure this is needed
 
   pinMode(wakeUpPin,INPUT);                         // This pin is active HIGH
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
   digitalWrite(blueLED,HIGH);                       // Turn on the led so we can see how long the Setup() takes
+
+  pinMode(disableModule, OUTPUT);
+  digitalWrite(disableModule, LOW);
+
+  delay(1000);
+  i2cScan();
 
   char responseTopic[125];
   String deviceID = System.deviceID();              // Multiple devices share the same hook - keeps things straight
@@ -178,7 +186,7 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("ResetCount", sysStatus.resetCount);
   Particle.variable("Temperature",current.temperature);
   Particle.variable("Release",currentPointRelease);
-  Particle.variable("stateOfChg", sysStatus.stateOfCharge);
+  Particle.variable("BatteryVoltage", sysStatus.batteryVoltage);
   Particle.variable("lowPowerMode",lowPowerModeStr);
   Particle.variable("OpenTime", openTimeStr);
   Particle.variable("CloseTime",closeTimeStr);
@@ -235,13 +243,28 @@ void setup()                                        // Note: Disconnected Setup(
 
   Log.info("Starting the TOF sensor");
 
-  if (distanceSensor.begin() != 0) //Begin returns 0 on a good init
+  if (distanceSensor.begin() != 0)                                    // Begin returns 0 on a good init
   {
     Log.info("TOF sensor initialization failed - ERROR State");
     state = ERROR_STATE;                                             // Device will not work without sensor so we will need to reset
     resetTimeStamp = millis();                                       // Likely close to zero but, for form's sake
     current.alerts = 12;                                             // FRAM is messed up so can't store but will be read in ERROR state
   }
+
+  // Initialize Accelerometer sensor
+	LIS3DHConfig config;
+	config.setAccelMode(LIS3DH::RATE_100_HZ);
+
+	bool setupSuccess = accel.setup(config);
+	Log.info("setupSuccess=%d", setupSuccess);
+
+  LIS3DHSample sample;
+	if (accel.getSample(sample)) {
+		Log.info("%d,%d,%d", sample.x, sample.y, sample.z);
+	}
+	else {
+		Log.info("LIS3DH no sample collected");
+	}
 
   // Take note if we are restarting due to a pin reset - either by the user or the watchdog - could be sign of trouble
   if (System.resetReason() == RESET_REASON_PIN_RESET || System.resetReason() == RESET_REASON_USER) { // Check to see if we are starting from a pin reset or a reset in the sketch
@@ -290,6 +313,11 @@ void setup()                                        // Note: Disconnected Setup(
   systemStatusWriteNeeded = true;                                      // Update FRAM with any changes from setup
   Log.info("Startup complete");
   digitalWrite(blueLED,LOW);                                           // Signal the end of startup
+
+  if (state == ERROR_STATE) {
+    Log.info("Stopping execution after startup error");
+    while(1);
+  }
 }
 
 
@@ -368,25 +396,6 @@ void loop()
         break;
       }
 
-      // If we are in a low battery state - we are not going to connect unless we are over-riding with user switch (active low)
-      if (sysStatus.lowBatteryMode && digitalRead(userSwitch)) {
-        Log.info("Connecting state but low battery mode");
-        state = IDLE_STATE;
-        break;
-      }
-      // If we are in low power mode, we may bail if battery is too low and we need to reduce reporting frequency
-      if (sysStatus.lowPowerMode && digitalRead(userSwitch)) {         // Low power mode and user switch not pressed
-        if (sysStatus.stateOfCharge <= 50 && (Time.hour() % 4)) {      // If the battery level is <50%, only connect every fourth hour
-          Log.info("Connecting but <50%% charge - four hour schedule");
-          state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
-          break;
-        }                                                              // Leave this state and go connect - will return only if we are successful in connecting
-        else if (sysStatus.stateOfCharge <= 65 && (Time.hour() % 2)) { // If the battery level is 50% -  65%, only connect every other hour
-          Log.info("Connecting but 50-65%% charge - two hour schedule");
-          state = IDLE_STATE;                                          // Will send us to connecting state - and it will send us back here
-          break;                                                       // Leave this state and go connect - will return only if we are successful in connecting
-        }
-      }
       // OK, let's do this thing!
       connectionStartTimeStamp = millis();                             // Have to use millis as the clock will get reset on connect
       Cellular.on();                                                   // Needed until they fix this: https://github.com/particle-iot/device-os/issues/1631
@@ -591,7 +600,7 @@ void  recordConnectionDetails()  {                                     // Whethe
  */
 void sendEvent() {
   char data[256];                                                     // Store the date in this character array - not global
-  snprintf(data, sizeof(data), "{\"height\":%i, \"percentfull\":%4.2f, \"trashcanemptied\":%i, \"battery\":%i,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.trashHeight, current.percentFull, current.trashcanEmptied, sysStatus.stateOfCharge, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, Time.now());
+  snprintf(data, sizeof(data), "{\"height\":%i, \"percentfull\":%4.2f, \"trashcanemptied\":%i, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.trashHeight, current.percentFull, current.trashcanEmptied, sysStatus.batteryVoltage, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, Time.now());
   PublishQueuePosix::instance().publish("Ubidots-Measurement-Hook-v1", data, PRIVATE | WITH_ACK);
   Log.info("Ubidots Webhook: %s", data);                              // For monitoring via serial
   current.alerts = 0;                                                 // Reset the alert after publish
@@ -667,7 +676,7 @@ void takeMeasurements()
   distanceSensor.startRanging();                                       // Write configuration bytes to initiate measurement
   distanceSensor.clearInterrupt();
 
-  while (!distanceSensor.checkForDataReady()) delay(1);
+  waitFor(distanceSensor.checkForDataReady,10000);
   current.trashHeight = int(distanceSensor.getDistance() * 0.0393701); //Get the result of the measurement from the sensor
   Log.info("Current reading %i inches",current.trashHeight);
   distanceSensor.clearInterrupt();
@@ -685,26 +694,19 @@ void takeMeasurements()
 
   sysStatus.batteryState = System.batteryState();                      // Call before isItSafeToCharge() as it may overwrite the context
 
-  isItSafeToCharge();                                                  // See if it is safe to charge
-
   if (sysStatus.lowPowerMode) {                                        // Need to take these steps if we are sleeping
     fuelGauge.quickStart();                                            // May help us re-establish a baseline for SoC
     delay(500);
   }
 
-  sysStatus.stateOfCharge = int(fuelGauge.getSoC());                   // Assign to system value
+  sysStatus.batteryVoltage = fuelGauge.getVCell();
 
-  if (sysStatus.stateOfCharge < 65 && sysStatus.batteryState == 1) {
-    System.setPowerConfiguration(SystemPowerConfiguration());          // Reset the PMIC
-    current.alerts = 11;                                               // Keep track of this
-  }
-
-  if (sysStatus.stateOfCharge < current.minBatteryLevel) {
-    current.minBatteryLevel = sysStatus.stateOfCharge;                 // Keep track of lowest value for the day
+  if (sysStatus.batteryVoltage < current.minBatteryLevel) {
+    current.minBatteryLevel = sysStatus.batteryVoltage;                 // Keep track of lowest value for the day
     currentStatusWriteNeeded = true;
   }
 
-  if (sysStatus.stateOfCharge < 30) {
+  if (sysStatus.batteryVoltage < 3.5) {
     sysStatus.lowBatteryMode = true;                                   // Check to see if we are in low battery territory
     if (!sysStatus.lowPowerMode) setLowPowerMode("1");                 // Should be there already but just in case...
   }
@@ -712,22 +714,6 @@ void takeMeasurements()
 
   systemStatusWriteNeeded = true;
   currentStatusWriteNeeded = true;
-}
-
-bool isItSafeToCharge()                                                // Returns a true or false if the battery is in a safe charging range.
-{
-  PMIC pmic(true);
-  if (current.temperature < 36 || current.temperature > 100 )  {       // Reference: https://batteryuniversity.com/learn/article/charging_at_high_and_low_temperatures (32 to 113 but with safety)
-    pmic.disableCharging();                                            // It is too cold or too hot to safely charge the battery
-    sysStatus.batteryState = 1;                                        // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
-    current.alerts = 10;                                                // Set a value of 1 indicating that it is not safe to charge due to high / low temps
-    return false;
-  }
-  else {
-    pmic.enableCharging();                                             // It is safe to charge the battery
-    if (current.alerts == 10) current.alerts = 0;                      // Reset the alerts flag if we previously had disabled charging
-    return true;
-  }
 }
 
 void getSignalStrength() {
@@ -1168,11 +1154,49 @@ void dailyCleanup() {
   sysStatus.clockSet = false;                                          // Once a day we need to reset the clock
   isDSTusa() ? Time.beginDST() : Time.endDST();                        // Perform the DST calculation here - once a day
 
-  if (sysStatus.solarPowerMode || sysStatus.stateOfCharge <= 65) {     // If Solar or if the battery is being discharged
-    setLowPowerMode("1");
-  }
+  setLowPowerMode("1");                                                // In case we forgot to set low power mode after setup
 
   resetEverything();                                                   // If so, we need to Zero the counts for the new day
 
   systemStatusWriteNeeded = true;
+}
+
+bool i2cScan() {                                            // Scan the i2c bus and publish the list of devices found
+	byte error, address;
+	int nDevices = 0;
+  char resultStr[128];
+  strncpy(resultStr,"i2c device(s) found at: ",sizeof(resultStr));
+
+	for(address = 1; address < 127; address++ )
+	{
+		// The i2c_scanner uses the return value of
+		// the Write.endTransmisstion to see if
+		// a device did acknowledge to the address.
+		Wire.beginTransmission(address);
+		error = Wire.endTransmission();
+
+		if (error == 0)
+		{
+      char tempString[4];
+      snprintf(tempString, sizeof(tempString), "%02X ",address);
+      strncat(resultStr,tempString,4);
+			nDevices++;
+      if (nDevices == 9) break;                    // All we have space to report in resultStr
+		}
+
+		else if (error==4) {
+      snprintf(resultStr,sizeof(resultStr),"Unknown error at address %02X", address);
+      Log.info(resultStr);
+      return 0;
+		}
+	}
+
+	if (nDevices == 0) {
+    snprintf(resultStr,sizeof(resultStr),"No I2C devices found");
+    Log.info(resultStr);
+    return 0;
+  }
+
+  Log.info(resultStr);
+  return 1;
 }
