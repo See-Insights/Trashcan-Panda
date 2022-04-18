@@ -39,6 +39,7 @@
 //v1 - Adapted from the Boron Connected Counter Code at release v44
 //v1.20 - Initial deployment to Morrisville, 6 hour wakeup, no more sensor config vairable. 
 //v1.30 - New version to accomodate LIS3DH sensor and the new pinouts on the Trashcan Panda sensor board
+//v1.31 - Looking to implement movement interru
 
 // Particle Product definitions
 void setup();
@@ -48,10 +49,12 @@ void sendEvent();
 void UbidotsHandler(const char *event, const char *data);
 void firmwareUpdateHandler(system_event_t event, int param);
 void takeMeasurements();
+void resolveLidPositionChange();
 void getSignalStrength();
 int getTemperature();
 void outOfMemoryHandler(system_event_t event, int param);
 void userSwitchISR();
+void sensorISR();
 int setPowerConfig();
 void loadSystemDefaults();
 void checkSystemValues();
@@ -71,10 +74,10 @@ int setLowPowerMode(String command);
 void publishStateTransition(void);
 void dailyCleanup();
 bool i2cScan();
-#line 38 "/Users/chipmc/Documents/Maker/Particle/Projects/Trashcan-Panda/src/Trashcan-Panda.ino"
+#line 39 "/Users/chipmc/Documents/Maker/Particle/Projects/Trashcan-Panda/src/Trashcan-Panda.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(1);
-char currentPointRelease[6] ="1.30";
+char currentPointRelease[6] ="1.31";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -92,6 +95,7 @@ struct currentStatus_structure {                    // currently 10 bytes long
   int placeholder;                                  // In period daily count
   unsigned long lastMeasureTime;                    // When did we record our height value
   bool trashcanEmptied;                             // Did the trashcan get emptied
+  uint8_t lidPos;                                   // Position of the lid: 0 = Unk, 1 - 4 Side, 5-Rightside up, 6-Upside down
   int temperature;                                  // Current Temperature inside the enclosure
   int alerts;                                       // What is the current alert value - see secret decoder ring at top of comments
   uint16_t maxConnectTime = 0;                      // Longest connect time for the hour
@@ -142,6 +146,7 @@ AB1805 ab1805(Wire);                                // Rickkas' RTC / Watchdog l
 FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state
 LIS3DHI2C accel(Wire, 1, intPin);                   // Initialize the accelerometer in i2c mode
 SFEVL53L1X distanceSensor;                          // Initialize the TOF sensor - no interrupts
+LIS3DHSample sample;                                // Stores latest value from the accelerometer
 
 // For monitoring / debugging, you can uncomment the next line
 Serial1LogHandler logHandler1(LOG_LEVEL_INFO);
@@ -187,7 +192,7 @@ int outOfMemory = -1;                               // From reference code provi
 // This section is where we will initialize sensor specific variables, libraries and function prototypes
 // Interrupt Variables
 volatile bool sensorDetect = false;                 // This is the flag that an interrupt is triggered
-volatile bool userSwitchDetect = false;              // Flag for a user switch press while in connected state
+volatile bool userSwitchDetect = false;             // Flag for a user switch press while in connected state
 
 Timer verboseCountsTimer(2*3600*1000, userSwitchISR, true);   // This timer will turn off verbose counts after 2 hours
 
@@ -201,7 +206,7 @@ void setup()                                        // Note: Disconnected Setup(
   pinMode(userSwitch,INPUT);                        // Momentary contact button on board for direct user input
   pinMode(blueLED, OUTPUT);                         // declare the Blue LED Pin as an output
   digitalWrite(blueLED,HIGH);                       // Turn on the led so we can see how long the Setup() takes
-
+  pinMode(intPin,INPUT);
   pinMode(disableModule, OUTPUT);
   digitalWrite(disableModule, LOW);
 
@@ -293,15 +298,17 @@ void setup()                                        // Note: Disconnected Setup(
 	config.setAccelMode(LIS3DH::RATE_100_HZ);
 
 	bool setupSuccess = accel.setup(config);
-	Log.info("setupSuccess=%d", setupSuccess);
-
-  LIS3DHSample sample;
-	if (accel.getSample(sample)) {
-		Log.info("%d,%d,%d", sample.x, sample.y, sample.z);
-	}
-	else {
-		Log.info("LIS3DH no sample collected");
-	}
+  if (setupSuccess) {
+    Log.info("LIS3DH Initialized successfully - Enabling Interrupt");
+    attachInterrupt(intPin,sensorISR,RISING);         // Watch for Lid movements and report them
+	  config.setPositionInterrupt(64);
+	  bool setupSuccess = accel.setup(config);
+    if (setupSuccess) Log.info("Position Interrupt Activated Successfully");
+  }
+  else {
+    Log.info("LIS3DH failed initialization - entering ERROR state");
+    state = ERROR_STATE;
+  }
 
   // Take note if we are restarting due to a pin reset - either by the user or the watchdog - could be sign of trouble
   if (System.resetReason() == RESET_REASON_PIN_RESET || System.resetReason() == RESET_REASON_USER) { // Check to see if we are starting from a pin reset or a reset in the sketch
@@ -365,7 +372,7 @@ void loop()
     if (state != oldState) publishStateTransition();
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
     if (firmwareUpdateInProgress) state= FIRMWARE_UPDATE;                                                     // This means there is a firemware update on deck
-    if (Time.hour() != Time.hour(lastReportedTime)) state = REPORTING_STATE;                                  // We want to report on the hour but not after bedtime
+    // if (Time.hour() != Time.hour(lastReportedTime)) state = REPORTING_STATE;                                  // We want to report on the hour but not after bedtime
     if ((Time.hour() >= sysStatus.closeTime) || (Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
     break;
 
@@ -406,7 +413,8 @@ void loop()
     ab1805.stopWDT();                                                  // If we are sleeping, we will miss petting the watchdog
     int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
     config.mode(SystemSleepMode::ULTRA_LOW_POWER)
-      .gpio(userSwitch,CHANGE)
+      .gpio(userSwitch,CHANGE)                                         // User presses the user button
+      .gpio(intPin,RISING)                                             // Lid position change woke the device
       .duration(wakeInSeconds * 1000);
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
@@ -474,12 +482,11 @@ void loop()
     takeMeasurements();                                               // Take Measurements here for reporting
     if (Time.hour() == sysStatus.openTime) dailyCleanup();            // Once a day, clean house and publish to Google Sheets
     sendEvent();                                                      // Publish hourly but not at opening time as there is nothing to publish
-    if (Time.hour() % 6 == 0 || Time.now() - sysStatus.lastConnection > 6 * 3600L)  {  // To save power, we will only connect three times a day at 6am, noon and 6pm
-      state = CONNECTING_STATE;                                       // Go to the connecting state
-    }
-    else state = IDLE_STATE;                                          // Go back to IDLE
-
-
+//    if (Time.hour() % 6 == 0 || Time.now() - sysStatus.lastConnection > 6 * 3600L)  {  // To save power, we will only connect three times a day at 6am, noon and 6pm
+//      state = CONNECTING_STATE;                                       // Go to the connecting state
+//    }
+//    else state = IDLE_STATE;                                          // Go back to IDLE
+state = IDLE_STATE;
     break;
 
   case RESP_WAIT_STATE: {
@@ -576,6 +583,8 @@ void loop()
 
   ab1805.loop();                                                       // Keeps the RTC synchronized with the Boron's clock
 
+  if (sensorDetect) resolveLidPositionChange();                        // Lid Movement - Need to report
+
   PublishQueuePosix::instance().loop();                                // Check to see if we need to tend to the message queue
 
   if (systemStatusWriteNeeded) {                                       // These flags get set when a value is changed
@@ -637,7 +646,7 @@ void  recordConnectionDetails()  {                                     // Whethe
  */
 void sendEvent() {
   char data[256];                                                     // Store the date in this character array - not global
-  snprintf(data, sizeof(data), "{\"height\":%i, \"percentfull\":%4.2f, \"trashcanemptied\":%i, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.trashHeight, current.percentFull, current.trashcanEmptied, sysStatus.batteryVoltage, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, Time.now());
+  snprintf(data, sizeof(data), "{\"height\":%i, \"percentfull\":%4.2f, \"trashcanemptied\":%d, \"lidPosition\":%d, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.trashHeight, current.percentFull, current.trashcanEmptied, current.lidPos  ,sysStatus.batteryVoltage, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, Time.now());
   PublishQueuePosix::instance().publish("Ubidots-Measurement-Hook-v1", data, PRIVATE | WITH_ACK);
   Log.info("Ubidots Webhook: %s", data);                              // For monitoring via serial
   current.alerts = 0;                                                 // Reset the alert after publish
@@ -715,14 +724,19 @@ void takeMeasurements()
 
   waitFor(distanceSensor.checkForDataReady,10000);
   current.trashHeight = int(distanceSensor.getDistance() * 0.0393701); //Get the result of the measurement from the sensor
+
+  if (isnan(current.trashHeight)) current.trashHeight = 0;
+
   Log.info("Current reading %i inches",current.trashHeight);
   distanceSensor.clearInterrupt();
 
   distanceSensor.sensorOff();                                          // Done - turn that puppy off 
   distanceSensor.stopRanging();
 
+
   current.trashHeight = constrain(current.trashHeight,sysStatus.trashFull,sysStatus.trashEmpty);
   current.percentFull = ((float)((sysStatus.trashEmpty-sysStatus.trashFull) - (current.trashHeight - sysStatus.trashFull))/(sysStatus.trashEmpty-sysStatus.trashFull))*100;
+
   if (current.percentFull < 20.0 && lastPercentFull > 30.0) current.trashcanEmptied = true;
   snprintf(percentFullStr,sizeof(percentFullStr),"%4.1f%% Full",current.percentFull);
   Log.info("Trashcan is %s and %s emptied", percentFullStr, (current.trashcanEmptied) ? "was": "was not");
@@ -735,6 +749,13 @@ void takeMeasurements()
     fuelGauge.quickStart();                                            // May help us re-establish a baseline for SoC
     delay(500);
   }
+
+	if (accel.getSample(sample)) {
+		Log.info("%d,%d,%d", sample.x, sample.y, sample.z);
+	}
+	else {
+		Serial.println("no sample");
+	}
 
   sysStatus.batteryVoltage = fuelGauge.getVCell();
 
@@ -751,6 +772,41 @@ void takeMeasurements()
 
   systemStatusWriteNeeded = true;
   currentStatusWriteNeeded = true;
+}
+
+/**
+ * @brief This is where we resolve the position of the lid when it moves
+ * 
+ * @details IF we are in this handler, the lid has changed position - this is not a "tap" or slight movement
+ * only coarse movements are recorded - this event will be reported and published on next connect
+ * 
+ * @param sensorDetect boolean flag set by interrupt
+ * 
+ */
+void resolveLidPositionChange() {
+  char positionMessage[32];
+  sensorDetect = false;
+  static uint8_t lastPos = 0;
+  current.lidPos = accel.readPositionInterrupt();
+  if (current.lidPos != 0 && current.lidPos != lastPos) {
+    switch (current.lidPos) {
+      case 6: 
+        snprintf(positionMessage,sizeof(positionMessage),"Upside Down");
+        break;
+      case 5: 
+        snprintf(positionMessage,sizeof(positionMessage),"Rightside Up");
+        break;
+      case 1 ... 4:
+        snprintf(positionMessage,sizeof(positionMessage),"On Side - Position = %d", current.lidPos);
+        break;
+      default:
+        snprintf(positionMessage,sizeof(positionMessage),"Not Defined - Position = %d", current.lidPos);
+        break;
+    }
+    Log.info(positionMessage);
+    lastPos = current.lidPos;
+    state = REPORTING_STATE;                                                  // Lid movement woke the device - let's report it
+  }
 }
 
 void getSignalStrength() {
@@ -792,6 +848,10 @@ void outOfMemoryHandler(system_event_t event, int param) {
 
 void userSwitchISR() {
   userSwitchDetect = true;                                            // The the flag for the user switch interrupt
+}
+
+void sensorISR() {
+  sensorDetect = true;
 }
 
 
@@ -858,6 +918,8 @@ void checkSystemValues() {                                          // Checks to
   if (sysStatus.openTime < 0 || sysStatus.openTime > 12) sysStatus.openTime = 0;
   if (sysStatus.closeTime < 12 || sysStatus.closeTime > 24) sysStatus.closeTime = 24;
   if (sysStatus.lastConnectionDuration > connectMaxTimeSec) sysStatus.lastConnectionDuration = 0;
+  if (sysStatus.trashFull == 0)  sysStatus.trashFull = 10;
+  if (sysStatus.trashEmpty == 0)  sysStatus.trashEmpty = 100;
 
   if (current.maxConnectTime > connectMaxTimeSec) {
     current.maxConnectTime = 0;
