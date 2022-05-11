@@ -8,6 +8,14 @@
 /*  This is a refinement on the Boron Connected Counter firmware and incorporates new watchdog and RTC
 *   capabilities as laid out in AN0023 - https://github.com/particle-iot/app-notes/tree/master/AN023-Watchdog-Timers
 *   This software is designed to work with a laser TOF sensor
+*   Concept of operations:
+*   This is a device that needs to last a year on a single battery - a 3.9V / 16aH Lithium Thionyl Chloride primary cell 
+*   It will wake hourly from open time to close time and take measurements of trash height, lid orientation and system data
+*   Three times a day (need to validate) at 6am, noon and 6pm - it will send the collected data to Particle via webhook and on to Ubidots
+*   Items yet to be worked on:
+*     - Using the TOF sensors' ability to "point" and "focus" to get a more accurate reading
+*     - Taking adiditional steps to ensure the device does not waste time connecting if there is an outage
+*     - Working out how to manage power on the sensor board (shutdown via i2c commands and the power line) - currently power on resets device
 */
 
 /* Alert Code Definitions
@@ -34,12 +42,13 @@
 //v1.20 - Initial deployment to Morrisville, 6 hour wakeup, no more sensor config vairable. 
 //v1.30 - New version to accomodate LIS3DH sensor and the new pinouts on the Trashcan Panda sensor board
 //v1.31 - Added position change interrupt for detecting the trascan lid being moved, current structure and Webhook updated with position
+//v1.40 - Updated with new production sensors (i2c address change) and moved to non-interrupt model - This is the first release
 
 
 // Particle Product definitions
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(1);
-char currentPointRelease[6] ="1.31";
+char currentPointRelease[6] ="1.40";
 
 namespace FRAM {                                    // Moved to namespace instead of #define to limit scope
   enum Addresses {
@@ -67,7 +76,6 @@ struct currentStatus_structure {                    // currently 10 bytes long
 
 
 // Included Libraries
-#include <Wire.h>
 #include "AB1805_RK.h"
 #include "BackgroundPublishRK.h"
 #include "PublishQueuePosixRK.h"
@@ -106,7 +114,7 @@ SystemSleepConfiguration config;                    // Initialize new Sleep 2.0 
 MB85RC64 fram(Wire, 0);                             // Rickkas' FRAM library
 AB1805 ab1805(Wire);                                // Rickkas' RTC / Watchdog library
 FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state
-LIS3DHI2C accel(Wire, 1, intPin);                   // Initialize the accelerometer in i2c mode
+LIS3DHI2C accel(Wire, 0, intPin);                   // Initialize the accelerometer in i2c mode
 SFEVL53L1X distanceSensor;                          // Initialize the TOF sensor - no interrupts
 LIS3DHSample sample;                                // Stores latest value from the accelerometer
 
@@ -125,7 +133,7 @@ State oldState = INITIALIZATION_STATE;
 const char* batteryContext[7] = {"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
 
 // Timing Variables
-const int wakeBoundary = 1*3600 + 0*60 + 0;         // Sets a reporting frequency of 1 hour 0 minutes 0 seconds
+int wakeBoundary = 1*3600 + 0*60 + 0;         // Sets a reporting frequency of 1 hour 0 minutes 0 seconds
 const unsigned long stayAwakeLong = 90000;          // In lowPowerMode, how long to stay awake every hour
 const unsigned long webhookWait = 30000;            // How long will we wait for a WebHook response
 const unsigned long resetWait = 30000;              // How long will we wait in ERROR_STATE until reset
@@ -140,7 +148,6 @@ unsigned long connectionStartTime;                  // Timestamp to keep track o
 bool dataInFlight = false;                          // Tracks if we have sent data but not yet received a response
 bool firmwareUpdateInProgress = false;              // Helps us track if a firmware update is in progress
 char SignalString[64];                              // Used to communicate Wireless RSSI and Description
-char batteryContextStr[16];                         // Tracks the battery context
 char percentFullStr[12];                             // How full is the trashcan
 char lowPowerModeStr[16];                           // In low power mode?
 char openTimeStr[8]="NA";                           // Park Open Time
@@ -153,7 +160,6 @@ int outOfMemory = -1;                               // From reference code provi
 
 // This section is where we will initialize sensor specific variables, libraries and function prototypes
 // Interrupt Variables
-volatile bool sensorDetect = false;                 // This is the flag that an interrupt is triggered
 volatile bool userSwitchDetect = false;             // Flag for a user switch press while in connected state
 
 Timer verboseCountsTimer(2*3600*1000, userSwitchISR, true);   // This timer will turn off verbose counts after 2 hours
@@ -171,9 +177,6 @@ void setup()                                        // Note: Disconnected Setup(
   pinMode(intPin,INPUT);
   pinMode(disableModule, OUTPUT);
   digitalWrite(disableModule, LOW);
-
-  delay(1000);
-  i2cScan();
 
   char responseTopic[125];
   String deviceID = System.deviceID();              // Multiple devices share the same hook - keeps things straight
@@ -196,14 +199,12 @@ void setup()                                        // Note: Disconnected Setup(
   Particle.variable("CloseTime",closeTimeStr);
   Particle.variable("Alerts",current.alerts);
   Particle.variable("TimeOffset",currentOffsetStr);
-  Particle.variable("BatteryContext",batteryContextMessage);
 
   Particle.function("setTrashEmpty", setTrashEmpty);                  // These are the functions exposed to the mobile app and console
   Particle.function("setTrashFull",setTrashFull);
   Particle.function("HardReset",hardResetNow);
   Particle.function("SendNow",sendNow);
   Particle.function("LowPowerMode",setLowPowerMode);
-  Particle.function("Solar-Mode",setSolarMode);
   Particle.function("Verbose-Mode",setVerboseMode);
   Particle.function("Set-Timezone",setTimeZone);
   Particle.function("Set-DSTOffset",setDSTOffset);
@@ -254,6 +255,7 @@ void setup()                                        // Note: Disconnected Setup(
     resetTimeStamp = millis();                                       // Likely close to zero but, for form's sake
     current.alerts = 12;                                             // FRAM is messed up so can't store but will be read in ERROR state
   }
+  else Log.info("TOF Sensor initialized");
 
   // Initialize Accelerometer sensor
 	LIS3DHConfig config;
@@ -261,14 +263,12 @@ void setup()                                        // Note: Disconnected Setup(
 
 	bool setupSuccess = accel.setup(config);
   if (setupSuccess) {
-    Log.info("LIS3DH Initialized successfully - Enabling Interrupt");
-    attachInterrupt(intPin,sensorISR,RISING);         // Watch for Lid movements and report them
-	  config.setPositionInterrupt(64);
+    Log.info("Accelerometer Initialized");
 	  bool setupSuccess = accel.setup(config);
-    if (setupSuccess) Log.info("Position Interrupt Activated Successfully");
+    if (setupSuccess) Log.info("Accelerometer setup complete");
   }
   else {
-    Log.info("LIS3DH failed initialization - entering ERROR state");
+    Log.info("Accelerometer failed initialization - entering ERROR state");
     state = ERROR_STATE;
   }
 
@@ -287,7 +287,6 @@ void setup()                                        // Note: Disconnected Setup(
   Time.zone(sysStatus.timezone);                                       // Set the Time Zone for our device
   snprintf(currentOffsetStr,sizeof(currentOffsetStr),"%2.1f UTC",(Time.local() - Time.now()) / 3600.0);   // Load the offset string
 
-
   // Next - check to make sure we are not in an endless update loop
   if (current.updateAttempts >= 3 && current.alerts != 23) {         // Send out alert the first time we are over the limit
     char data[64];
@@ -302,9 +301,6 @@ void setup()                                        // Note: Disconnected Setup(
 
   // Strings make it easier to read the system values in the console / mobile app
   makeUpStringMessages();                                              // Updated system settings - refresh the string messages
-
-  // Make sure we have the right power settings
-  setPowerConfig();                                                    // Executes commands that set up the Power configuration between Solar and DC-Powered
 
   takeMeasurements();                                                  // Populates values so you can read them before the hour
   if (sysStatus.lowBatteryMode) setLowPowerMode("1");                  // If battery is low we need to go to low power state
@@ -334,8 +330,8 @@ void loop()
     if (state != oldState) publishStateTransition();
     if (sysStatus.lowPowerMode && (millis() - stayAwakeTimeStamp) > stayAwake) state = NAPPING_STATE;         // When in low power mode, we can nap between taps
     if (firmwareUpdateInProgress) state= FIRMWARE_UPDATE;                                                     // This means there is a firemware update on deck
+    if ((Time.hour() >= sysStatus.closeTime) || (Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep - with reporting next we will get the last reading before bed first
     if (Time.hour() != Time.hour(lastReportedTime)) state = REPORTING_STATE;                                  // We want to report on the hour but not after bedtime
-    if ((Time.hour() >= sysStatus.closeTime) || (Time.hour() < sysStatus.openTime)) state = SLEEPING_STATE;   // The park is closed - sleep
     break;
 
   case SLEEPING_STATE: {                                               // This state is triggered once the park closes and runs until it opens - Sensor is off and interrupts disconnected
@@ -344,7 +340,10 @@ void loop()
     stayAwake = 1000;                                                  // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
     state = IDLE_STATE;                                                // Head back to the idle state after we sleep
     ab1805.stopWDT();                                                  // No watchdogs interrupting our slumber
-    int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary) + 1;  // Adding one second to reduce prospect of round tripping to IDLE
+    digitalWrite(disableModule,true);                                  // Shut down the sensor module
+    int fullNightSleepSeconds = ((Time.hour() >= sysStatus.closeTime) ? (24 - (sysStatus.closeTime - sysStatus.openTime)) : (sysStatus.openTime - Time.hour())) * 3600;    // The number of seconds between close and open time
+    int wakeInSeconds = constrain(fullNightSleepSeconds - Time.now() % 3600, 1, fullNightSleepSeconds) + 1;  // Adding one second to reduce prospect of round tripping to IDLE
+    Log.info("Going to sleep for %i seconds",wakeInSeconds);
     config.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .gpio(userSwitch,CHANGE)
       .duration(wakeInSeconds * 1000);
@@ -364,19 +363,19 @@ void loop()
     else if (Time.hour() < sysStatus.closeTime && Time.hour() >= sysStatus.openTime) { // We might wake up and find it is opening time.  Park is open let's get ready for the day
       stayAwake = stayAwakeLong;                                       // Keeps Boron awake after deep sleep - may not be needed
     }
+    digitalWrite(disableModule,false);                                  // This will reset the device
     } break;
 
   case NAPPING_STATE: {                                                // This state puts the device in low power mode quickly - napping supports the sensor activity and interrupts
     if (state != oldState) publishStateTransition();
-    if (sensorDetect)  break;                                          // Don't nap until we are done with event - exits back to main loop but stays in napping state
     if (Particle.connected() || !Cellular.isOff()) disconnectFromParticle();           // Disconnect cleanly from Particle and power down the modem
     stayAwake = 1000;                                                  // Once we come into this function, we need to reset stayAwake as it changes at the top of the hour
     state = IDLE_STATE;                                                // Back to the IDLE_STATE after a nap - not enabling updates here as napping is typicallly disconnected
     ab1805.stopWDT();                                                  // If we are sleeping, we will miss petting the watchdog
     int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+    Log.info("Napping for %i seconds",wakeInSeconds);
     config.mode(SystemSleepMode::ULTRA_LOW_POWER)
       .gpio(userSwitch,CHANGE)                                         // User presses the user button
-      .gpio(intPin,RISING)                                             // Lid position change woke the device
       .duration(wakeInSeconds * 1000);
     SystemSleepResult result = System.sleep(config);                   // Put the device to sleep
     ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
@@ -544,8 +543,6 @@ void loop()
 
   ab1805.loop();                                                       // Keeps the RTC synchronized with the Boron's clock
 
-  if (sensorDetect) resolveLidPositionChange();                        // Lid Movement - Need to report
-
   PublishQueuePosix::instance().loop();                                // Check to see if we need to tend to the message queue
 
   if (systemStatusWriteNeeded) {                                       // These flags get set when a value is changed
@@ -607,7 +604,7 @@ void  recordConnectionDetails()  {                                     // Whethe
  */
 void sendEvent() {
   char data[256];                                                     // Store the date in this character array - not global
-  snprintf(data, sizeof(data), "{\"height\":%i, \"percentfull\":%4.2f, \"trashcanemptied\":%d, \"lidPosition\":%d, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.trashHeight, current.percentFull, current.trashcanEmptied, current.lidPos  ,sysStatus.batteryVoltage, batteryContext[sysStatus.batteryState], current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, Time.now());
+  snprintf(data, sizeof(data), "{\"height\":%i, \"percentfull\":%4.2f, \"trashcanemptied\":%d, \"lidPosition\":%d, \"battery\":%4.2f, \"temp\":%i, \"resets\":%i, \"alerts\":%i,\"connecttime\":%i,\"timestamp\":%lu000}",current.trashHeight, current.percentFull, current.trashcanEmptied, current.lidPos  ,sysStatus.batteryVoltage, current.temperature, sysStatus.resetCount, current.alerts, sysStatus.lastConnectionDuration, Time.now());
   PublishQueuePosix::instance().publish("Ubidots-Measurement-Hook-v1", data, PRIVATE | WITH_ACK);
   Log.info("Ubidots Webhook: %s", data);                              // For monitoring via serial
   current.alerts = 0;                                                 // Reset the alert after publish
@@ -675,54 +672,55 @@ void firmwareUpdateHandler(system_event_t event, int param) {
 // These are the functions that are part of the takeMeasurements call
 void takeMeasurements()
 { 
-
   float lastPercentFull = current.percentFull;                         // Going to see if the trashcan was emptied
 
   // Read the height of the trash in the can
   distanceSensor.sensorOn();                                           // Fire up the sensor
   distanceSensor.startRanging();                                       // Write configuration bytes to initiate measurement
-  distanceSensor.clearInterrupt();
-
   waitFor(distanceSensor.checkForDataReady,10000);
   current.trashHeight = int(distanceSensor.getDistance() * 0.0393701); //Get the result of the measurement from the sensor
-
   if (isnan(current.trashHeight)) current.trashHeight = 0;
-
-  Log.info("Current reading %i inches",current.trashHeight);
   distanceSensor.clearInterrupt();
-
   distanceSensor.sensorOff();                                          // Done - turn that puppy off 
   distanceSensor.stopRanging();
 
-
+  // Calculate percent full and log information
   current.trashHeight = constrain(current.trashHeight,sysStatus.trashFull,sysStatus.trashEmpty);
   current.percentFull = ((float)((sysStatus.trashEmpty-sysStatus.trashFull) - (current.trashHeight - sysStatus.trashFull))/(sysStatus.trashEmpty-sysStatus.trashFull))*100;
 
+  // Was trashcan emptied?
   if (current.percentFull < 20.0 && lastPercentFull > 30.0) current.trashcanEmptied = true;
   snprintf(percentFullStr,sizeof(percentFullStr),"%4.1f%% Full",current.percentFull);
-  Log.info("Trashcan is %s and %s emptied", percentFullStr, (current.trashcanEmptied) ? "was": "was not");
+  Log.info("Trash height is %i and can is %s and %s emptied", current.trashHeight, percentFullStr, (current.trashcanEmptied) ? "was": "was not");
 
+  // Get temp - primarily for battery charging decisions
   getTemperature();                                                    // Get Temperature at startup as well
 
-  sysStatus.batteryState = System.batteryState();                      // Call before isItSafeToCharge() as it may overwrite the context
-
-  if (sysStatus.lowPowerMode) {                                        // Need to take these steps if we are sleeping
-    fuelGauge.quickStart();                                            // May help us re-establish a baseline for SoC
-    delay(500);
+ 
+  LIS3DHSample sample;
+  if (accel.getSample(sample)) {
+    int threshold = 10000;
+    if (sample.z > threshold) {
+      Log.info("Lid rightside up with x:%d, y:%d, z:%d", sample.x, sample.y, sample.z);
+      current.lidPos = 5;
+    }
+    else if (sample.z < -1 * threshold) {
+      Log.info("Lid upside down x:%d, y:%d, z:%d", sample.x, sample.y, sample.z);
+      current.lidPos = 6;
+    }
+    else {
+      Log.info("Lid on side x:%d, y:%d, z:%d", sample.x, sample.y, sample.z);
+      current.lidPos = 1;
+    }
+  }
+  else {
+    Serial.println("no sample");
   }
 
-	if (accel.getSample(sample)) {
-		Log.info("%d,%d,%d", sample.x, sample.y, sample.z);
-	}
-	else {
-		Serial.println("no sample");
-	}
-
+  // Check battery - this application is for a Lithium Thionnly Chloride primary cell so no charging is possible
   sysStatus.batteryVoltage = fuelGauge.getVCell();
-
   if (sysStatus.batteryVoltage < current.minBatteryLevel) {
-    current.minBatteryLevel = sysStatus.batteryVoltage;                 // Keep track of lowest value for the day
-    currentStatusWriteNeeded = true;
+    current.minBatteryLevel = sysStatus.batteryVoltage;                // Keep track of lowest value for the day
   }
 
   if (sysStatus.batteryVoltage < 3.5) {
@@ -733,41 +731,6 @@ void takeMeasurements()
 
   systemStatusWriteNeeded = true;
   currentStatusWriteNeeded = true;
-}
-
-/**
- * @brief This is where we resolve the position of the lid when it moves
- * 
- * @details IF we are in this handler, the lid has changed position - this is not a "tap" or slight movement
- * only coarse movements are recorded - this event will be reported and published on next connect
- * 
- * @param sensorDetect boolean flag set by interrupt
- * 
- */
-void resolveLidPositionChange() {
-  char positionMessage[32];
-  sensorDetect = false;
-  static uint8_t lastPos = 0;
-  current.lidPos = accel.readPositionInterrupt();
-  if (current.lidPos != 0 && current.lidPos != lastPos) {
-    switch (current.lidPos) {
-      case 6: 
-        snprintf(positionMessage,sizeof(positionMessage),"Upside Down");
-        break;
-      case 5: 
-        snprintf(positionMessage,sizeof(positionMessage),"Rightside Up");
-        break;
-      case 1 ... 4:
-        snprintf(positionMessage,sizeof(positionMessage),"On Side - Position = %d", current.lidPos);
-        break;
-      default:
-        snprintf(positionMessage,sizeof(positionMessage),"Not Defined - Position = %d", current.lidPos);
-        break;
-    }
-    Log.info(positionMessage);
-    lastPos = current.lidPos;
-    state = REPORTING_STATE;                                                  // Lid movement woke the device - let's report it
-  }
 }
 
 void getSignalStrength() {
@@ -810,39 +773,6 @@ void outOfMemoryHandler(system_event_t event, int param) {
 void userSwitchISR() {
   userSwitchDetect = true;                                            // The the flag for the user switch interrupt
 }
-
-void sensorISR() {
-  sensorDetect = true;
-}
-
-
-// Power Management function
-int setPowerConfig() {
-  SystemPowerConfiguration conf;
-  System.setPowerConfiguration(SystemPowerConfiguration());            // To restore the default configuration
-  if (sysStatus.solarPowerMode) {
-    conf.powerSourceMaxCurrent(900)                                    // Set maximum current the power source can provide (applies only when powered through VIN)
-        .powerSourceMinVoltage(5080)                                   // Set minimum voltage the power source can provide (applies only when powered through VIN)
-        .batteryChargeCurrent(900)                                     // Set battery charge current
-        .batteryChargeVoltage(4208)                                    // Set battery termination voltage
-        .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST);  // For the cases where the device is powered through VIN
-                                                                       // but the USB cable is connected to a USB host, this feature flag
-                                                                       // enforces the voltage/current limits specified in the configuration
-                                                                       // (where by default the device would be thinking that it's powered by the USB Host)
-    int res = System.setPowerConfiguration(conf);                      // returns SYSTEM_ERROR_NONE (0) in case of success
-    return res;
-  }
-  else  {
-    conf.powerSourceMaxCurrent(900)                                   // default is 900mA
-        .powerSourceMinVoltage(4208)                                  // This is the default value for the Boron
-        .batteryChargeCurrent(900)                                    // higher charge current from DC-IN when not solar powered
-        .batteryChargeVoltage(4112)                                   // default is 4.112V termination voltage
-        .feature(SystemPowerFeature::USE_VIN_SETTINGS_WITH_USB_HOST) ;
-    int res = System.setPowerConfiguration(conf);                     // returns SYSTEM_ERROR_NONE (0) in case of success
-    return res;
-  }
-}
-
 
 void loadSystemDefaults() {                                           // Default settings for the device - connected, not-low power and always on
   if (Particle.connected()) {
@@ -979,26 +909,6 @@ void resetEverything() {                                              // The dev
   systemStatusWriteNeeded = true;
 }
 
-int setSolarMode(String command) // Function to force sending data in current hour
-{
-  if (command == "1")
-  {
-    sysStatus.solarPowerMode = true;
-    setPowerConfig();                                               // Change the power management Settings
-    systemStatusWriteNeeded=true;
-    if (Particle.connected()) Particle.publish("Mode","Set Solar Powered Mode", PRIVATE);
-    return 1;
-  }
-  else if (command == "0")
-  {
-    sysStatus.solarPowerMode = false;
-    systemStatusWriteNeeded=true;
-    setPowerConfig();                                                // Change the power management settings
-    if (Particle.connected()) Particle.publish("Mode","Cleared Solar Powered Mode", PRIVATE);
-    return 1;
-  }
-  else return 0;
-}
 
 /**
  * @brief Turns on/off verbose mode.
@@ -1029,15 +939,6 @@ int setVerboseMode(String command) // Function to force sending data in current 
     return 1;
   }
   else return 0;
-}
-
-/**
- * @brief Returns a string describing the battery state.
- *
- * @return String describing battery state.
- */
-String batteryContextMessage() {
-  return batteryContext[sysStatus.batteryState];
 }
 
 /**
@@ -1189,7 +1090,9 @@ int setLowPowerMode(String command)                                   // This is
 void publishStateTransition(void)
 {
   char stateTransitionString[40];
-  snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s", stateNames[oldState],stateNames[state]);
+  char timeString[16];
+  strncpy(timeString,Time.format(Time.now(), "%I:%M:%S %p."),sizeof(timeString));
+  snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s at %s", stateNames[oldState],stateNames[state],timeString );
   oldState = state;
   if (sysStatus.verboseMode) {
     if (Particle.connected()) {
@@ -1219,44 +1122,4 @@ void dailyCleanup() {
   resetEverything();                                                   // If so, we need to Zero the counts for the new day
 
   systemStatusWriteNeeded = true;
-}
-
-bool i2cScan() {                                            // Scan the i2c bus and publish the list of devices found
-	byte error, address;
-	int nDevices = 0;
-  char resultStr[128];
-  strncpy(resultStr,"i2c device(s) found at: ",sizeof(resultStr));
-
-	for(address = 1; address < 127; address++ )
-	{
-		// The i2c_scanner uses the return value of
-		// the Write.endTransmisstion to see if
-		// a device did acknowledge to the address.
-		Wire.beginTransmission(address);
-		error = Wire.endTransmission();
-
-		if (error == 0)
-		{
-      char tempString[4];
-      snprintf(tempString, sizeof(tempString), "%02X ",address);
-      strncat(resultStr,tempString,4);
-			nDevices++;
-      if (nDevices == 9) break;                    // All we have space to report in resultStr
-		}
-
-		else if (error==4) {
-      snprintf(resultStr,sizeof(resultStr),"Unknown error at address %02X", address);
-      Log.info(resultStr);
-      return 0;
-		}
-	}
-
-	if (nDevices == 0) {
-    snprintf(resultStr,sizeof(resultStr),"No I2C devices found");
-    Log.info(resultStr);
-    return 0;
-  }
-
-  Log.info(resultStr);
-  return 1;
 }
