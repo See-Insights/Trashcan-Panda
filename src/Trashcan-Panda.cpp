@@ -14,6 +14,14 @@
 /*  This is a refinement on the Boron Connected Counter firmware and incorporates new watchdog and RTC
 *   capabilities as laid out in AN0023 - https://github.com/particle-iot/app-notes/tree/master/AN023-Watchdog-Timers
 *   This software is designed to work with a laser TOF sensor
+*   Concept of operations:
+*   This is a device that needs to last a year on a single battery - a 3.9V / 16aH Lithium Thionyl Chloride primary cell 
+*   It will wake hourly from open time to close time and take measurements of trash height, lid orientation and system data
+*   Three times a day (need to validate) at 6am, noon and 6pm - it will send the collected data to Particle via webhook and on to Ubidots
+*   Items yet to be worked on:
+*     - Using the TOF sensors' ability to "point" and "focus" to get a more accurate reading
+*     - Taking adiditional steps to ensure the device does not waste time connecting if there is an outage
+*     - Working out how to manage power on the sensor board (shutdown via i2c commands and the power line) - currently power on resets device
 */
 
 /* Alert Code Definitions
@@ -40,7 +48,7 @@
 //v1.20 - Initial deployment to Morrisville, 6 hour wakeup, no more sensor config vairable. 
 //v1.30 - New version to accomodate LIS3DH sensor and the new pinouts on the Trashcan Panda sensor board
 //v1.31 - Added position change interrupt for detecting the trascan lid being moved, current structure and Webhook updated with position
-//v1.40 - Updated with new production sensors (i2c address change) and moved to non-interrupt model
+//v1.40 - Updated with new production sensors (i2c address change) and moved to non-interrupt model - This is the first release
 
 
 // Particle Product definitions
@@ -70,7 +78,7 @@ int setTrashEmpty(String command);
 int setLowPowerMode(String command);
 void publishStateTransition(void);
 void dailyCleanup();
-#line 41 "/Users/chipmc/Documents/Maker/Particle/Projects/Trashcan-Panda/src/Trashcan-Panda.ino"
+#line 49 "/Users/chipmc/Documents/Maker/Particle/Projects/Trashcan-Panda/src/Trashcan-Panda.ino"
 PRODUCT_ID(PLATFORM_ID);                            // No longer need to specify - but device needs to be added to product ahead of time.
 PRODUCT_VERSION(1);
 char currentPointRelease[6] ="1.40";
