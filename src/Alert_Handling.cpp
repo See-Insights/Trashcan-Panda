@@ -90,11 +90,14 @@ int Alert_Handling::alertResolution() {
 
     case 31:                                                       // Device failed to connect - bailing for this hour or resetting depending
       if (Time.now() - sysStatus.get_lastConnection() > 2 * 3600L) {     // If we fail to connect for a couple hours in a row, let's power cycle the device
+        Log.info("Device has failed to connect for 2+ hours - resetting");
         sysStatus.set_lastConnection(Time.now());                  // Make sure we don't do this very often
         resolutionCode = 3;                                         // This will generate a hard reset
       }
-      resolutionCode = 0;                                         // Default - no action will be taken
-      Log.info("Failed to connect - try again next hour");
+      else {
+        Log.info("Failed to connect - try again next hour");
+        resolutionCode = 0;                                         // Default - no action will be taken
+      }
       break;
 
     case 32:                                                       // We are still trying to connect but need to reset first as it is not happening quickly enough

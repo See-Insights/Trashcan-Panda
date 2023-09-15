@@ -47,6 +47,8 @@
 //v2.00 - Going to reduce the number of SPADs in use to 8 to focus measurement area - updated to deviceOS@4.1.0
 //v3.00 - Updating for bad sensor behaviour, adding a waitFor on the serial connection, hard coding the full and empty values
 //v4.00 - Implementing classes - adopted from Connected Counter Next
+//v4.01 - Minor fixes - still reports hourly
+//v4.02 - Found an error with AlertHandler for code 31 - Device will now power cycle if it failes to connect for 2+ hours
 
 // Need to update code - time initializion is a mess
 // Need to update code - need to add a check for the battery voltage and if it is too low, we need to go into low power mode
@@ -65,7 +67,7 @@
 #include "Particle_Functions.h"
 #include "take_measurements.h"
 
-#define FIRMWARE_RELEASE 4.0						            // Will update this and report with stats
+#define FIRMWARE_RELEASE 4.01						            // Will update this and report with stats
 PRODUCT_VERSION(4);									                // For now, we are putting nodes and gateways in the same product group - need to deconflict #
 
 // Prototype Functions

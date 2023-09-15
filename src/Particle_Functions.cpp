@@ -109,7 +109,8 @@ int Particle_Functions::jsonFunctionParser(String command) {
       // Format - function - status, variables - short, long
       // Test - {"cmd":[{"var":"short", "fn":"status"}]}
       Take_Measurements::instance().takeMeasurements();
-      snprintf(data, sizeof(data),"Height: %d\" and %4.2f%% full with lid %s and battery: %4.2fV",current.get_trashHeight(), current.get_percentFull(), (current.get_lidPosition() == 1) ? "incorret" : "correct", current.get_batteryVoltage());
+      snprintf(data, sizeof(data),"Height: %d\" and %4.2f%% full.  Lid is %s and battery is %4.2fV",current.get_trashHeight(), current.get_percentFull(), (current
+    .get_lidPosition() == 1) ? "on its side" : (current.get_lidPosition() == 5) ? "right side up" : "upside down", current.get_batteryVoltage());
       Log.info(data);
       Particle.publish("status",data,PRIVATE);
       if (variable == "long") {

@@ -62,8 +62,11 @@ void Measure_Trash::loop() {
 void Measure_Trash::measureHeight() // This is where we check to see if an interrupt is set when not asleep or act on a tap that woke the device
 {
   float lastPercentFull = current.get_percentFull();                   // Going to see if the trashcan was emptied
+  int successfulRead = 2;
 
   // Read the height of the trash in the can
+  distanceSensor.sensorOff();                                          // Turn off the sensor
+  delay(100);
   distanceSensor.sensorOn();                                           // Fire up the sensor
 
   // focus the detection area
@@ -78,9 +81,11 @@ void Measure_Trash::measureHeight() // This is where we check to see if an inter
   if (distanceSensor.checkForDataReady()) {
     // Calculate the height of the trash in the can
     current.set_trashHeight(int(distanceSensor.getDistance() * 0.0393701)); //Get the result of the measurement from the sensor
-    if (isnan(current.get_trashHeight())) current.set_trashHeight(0);
-
-    Log.info("Data ready and distance is %i inches", current.get_trashHeight());
+    if (isnan(current.get_trashHeight())) {
+      successfulRead--;
+      Log.info("Data ready but not valid");
+    }
+    else Log.info("Data ready and distance is %i\"", current.get_trashHeight());
 
     // Calculate percent full and log information
     current.set_trashHeight(constrain(current.get_trashHeight(),sysStatus.get_trashFull(),sysStatus.get_trashEmpty()));
@@ -88,14 +93,18 @@ void Measure_Trash::measureHeight() // This is where we check to see if an inter
 
     // Was trashcan emptied?
     if (current.get_percentFull() < 20.0 && lastPercentFull > 30.0) current.set_trashcanEmptied(true);
-    Log.info("Trash height is %i and can is %4.1f%% full and %s emptied", current.get_trashHeight(),current.get_percentFull(), (current.get_trashcanEmptied()) ? "was": "was not");
+    else current.set_trashcanEmptied(false);
   }
-  else Log.info("TOF Data not ready");
+  else {
+    Log.info("TOF Data not ready");
+    successfulRead--;
+  }
 
   distanceSensor.clearInterrupt();
-  distanceSensor.sensorOff();                                          // Done - turn that puppy off 
   distanceSensor.stopRanging();
+  distanceSensor.sensorOff();                                          // Done - turn that puppy off 
 
+  // Read the accelerometer to see if the trashcan lid is on its side
   LIS3DHSample sample;
 
   if (accel.getSample(sample)) {
@@ -114,6 +123,19 @@ void Measure_Trash::measureHeight() // This is where we check to see if an inter
     }
   }
   else {
-    Serial.println("no sample");
+    successfulRead--;
+    Serial.println("Accelerometer had no sample");
   }
+
+  if (successfulRead < 2) {
+    Log.info("Not all sensors read successfully");
+    current.set_trashHeight(0);
+    current.set_percentFull(0);
+    current.set_lidPosition(0);
+  }
+  else {
+    Log.info("Trash height is %i\" and can is %4.1f%% full and %s emptied.  The lid is %s", current.get_trashHeight(),current.get_percentFull(), (current.get_trashcanEmptied()) ? "was": "was not", (current
+    .get_lidPosition() == 1) ? "on its side" : (current.get_lidPosition() == 5) ? "right side up" : "upside down");
+  }
+
 }
